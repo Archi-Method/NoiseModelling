@@ -511,8 +511,8 @@ def exec(Connection connection, Map input, ProgressVisitor progress) {
             parameters.setRaysTable(input['confRaysName'] as String)
             parameters.setExportRaysMethod(NoiseMapDatabaseParameters.ExportRaysMethods.TO_RAYS_TABLE)
             parameters.exportAttenuationMatrix = true
-            parameters.exportAttenuationOutput = true
-            parameters.keepAbsorption = true
+            parameters.exportAttenuationOutput = false
+            parameters.keepAbsorption = false
         }
     }
 
