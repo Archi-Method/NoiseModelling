@@ -10,3 +10,5 @@ profile_*.csv
 venv/
 .DS_Store
 *.trace.db
+/lib
+
