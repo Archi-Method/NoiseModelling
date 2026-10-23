@@ -1,0 +1,92 @@
+name: UrbanMetrix ZIP release
+
+on:
+  push:
+    branches: [main, urbanmetrix]
+  workflow_dispatch:
+
+concurrency:
+  group: um-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    services:
+      postgres:
+        image: imresamu/postgis:17-3.5
+        env:
+          POSTGRES_USER: noisemodelling
+          POSTGRES_PASSWORD: noisemodelling
+          POSTGRES_DB: noisemodelling_db
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Select next UrbanMetrix version
+        id: version
+        shell: python
+        run: |
+          import os
+          import re
+          import subprocess
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse('pom.xml').getroot()
+          base = root.find('{http://maven.apache.org/POM/4.0.0}version').text.removesuffix('-SNAPSHOT')
+          if not re.fullmatch(r'\d+\.\d+\.\d+', base):
+              raise ValueError(f'Expected a semantic base version, got {base!r}')
+          tags = subprocess.check_output(['git', 'tag', '--list'], text=True).splitlines()
+          pattern = re.compile(rf'v{re.escape(base)}-um\.(\d+)')
+          numbers = [int(match[1]) for tag in tags if (match := pattern.fullmatch(tag))]
+          version = f'{base}-um.{max(numbers, default=0) + 1}'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          print(f'Releasing {version} from {os.environ["GITHUB_SHA"]}')
+      - name: Build and test ZIP
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: '5432'
+          POSTGRES_DB: noisemodelling_db
+          POSTGRES_USER: noisemodelling
+          POSTGRES_PASSWORD: noisemodelling
+        run: |
+          # Version changes exist only in this runner; the tag points to the original source commit.
+          mvn -B versions:set -DnewVersion="$RELEASE_VERSION" -DgenerateBackupPoms=false
+          mvn -B clean verify
+      - name: Smoke test packaged ScriptRunner
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          unzip -q "noisemodelling-scripts/target/NoiseModelling_${RELEASE_VERSION}.zip" -d "$RUNNER_TEMP/nm"
+          cd "$RUNNER_TEMP/nm/"*/
+          test -d lib
+          chmod +x bin/ScriptRunner
+          bin/ScriptRunner -w "$RUNNER_TEMP/h2gis_ws" -s get_started_tutorial_complex.groovy
+      - name: Publish ZIP and release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v${RELEASE_VERSION}" \
+            "noisemodelling-scripts/target/NoiseModelling_${RELEASE_VERSION}.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "NoiseModelling ${RELEASE_VERSION}" \
+            --generate-notes \
+            --latest
