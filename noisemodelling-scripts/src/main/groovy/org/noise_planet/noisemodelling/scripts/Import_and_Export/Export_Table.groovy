@@ -48,6 +48,13 @@ inputs = [
                              'For example: c:/home/receivers.geojson',
                 type: String.class
         ],
+        confExportHomogeneousRaysOnly: [
+                name: 'Export homogeneous rays only',
+                title: 'Export homogeneous rays only',
+                description: 'Export only homogeneous noise rays and the columns used by the simulator.',
+                default: false,
+                type: Boolean.class
+        ],
         tableToExport: [
                 name:        'Name of the table to export',
                 title:       'Name of the table',
@@ -71,6 +78,7 @@ outputs = [
 ]
 
 def exec(Connection connection, Map input, ProgressVisitor progress) {
+    boolean homogeneousOnly = input.getOrDefault('confExportHomogeneousRaysOnly', false) as Boolean
 
     // output string, the information given back to the user
     String resultString = null
@@ -90,6 +98,10 @@ def exec(Connection connection, Map input, ProgressVisitor progress) {
     String tableToExport = input["tableToExport"] as String
     // do it case-insensitive
     tableToExport = tableToExport.toUpperCase()
+    if (homogeneousOnly) {
+        tableToExport = "(SELECT THE_GEOM, IDRECEIVER, IDSOURCE, LEQ, METEO FROM " + tableToExport +
+                " WHERE METEO = 'homogeneous')"
+    }
 
     List<String> fields = JDBCUtilities.getColumnNames(connection, tableToExport)
     if (fields.size()<1)
@@ -110,8 +122,16 @@ def exec(Connection connection, Map input, ProgressVisitor progress) {
             dbfDriver.exportTable(connection, tableToExport, new File(exportPath),true, progress)
             break
         case "geojson":
-            GeoJsonDriverFunction geoJsonDriver = new GeoJsonDriverFunction()
-            geoJsonDriver.exportTable(connection, tableToExport, new File(exportPath),true,  progress)
+            boolean hasRows = connection.createStatement().withCloseable { statement ->
+                statement.executeQuery("SELECT 1 FROM " + tableToExport + " LIMIT 1").withCloseable { rows -> rows.next() }
+            }
+            // H2GIS cannot infer geometry metadata from an empty query result.
+            if (!hasRows) {
+                new File(exportPath).setText('{"type":"FeatureCollection","features":[]}', 'UTF-8')
+            } else {
+                GeoJsonDriverFunction geoJsonDriver = new GeoJsonDriverFunction()
+                geoJsonDriver.exportTable(connection, tableToExport, new File(exportPath),true,  progress)
+            }
             break
         case "json":
             JsonDriverFunction jsonDriver = new JsonDriverFunction()
