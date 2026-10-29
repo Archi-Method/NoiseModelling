@@ -55,6 +55,13 @@ inputs = [
                 default: false,
                 type: Boolean.class
         ],
+        confExportRaysPeriod: [
+                name: 'Ray export period',
+                title: 'Ray export period',
+                description: 'Export noise rays for D, E, or N. Leave empty to export all periods.',
+                default: '',
+                type: String.class
+        ],
         tableToExport: [
                 name:        'Name of the table to export',
                 title:       'Name of the table',
@@ -79,6 +86,10 @@ outputs = [
 
 def exec(Connection connection, Map input, ProgressVisitor progress) {
     boolean homogeneousOnly = input.getOrDefault('confExportHomogeneousRaysOnly', false) as Boolean
+    String rayPeriod = (input.get('confExportRaysPeriod') ?: '').toString().trim().toUpperCase(Locale.ROOT)
+    if (rayPeriod && !(rayPeriod in ['D', 'E', 'N'])) {
+        throw new IllegalArgumentException('confExportRaysPeriod must be D, E, N, or empty')
+    }
 
     // output string, the information given back to the user
     String resultString = null
@@ -98,9 +109,12 @@ def exec(Connection connection, Map input, ProgressVisitor progress) {
     String tableToExport = input["tableToExport"] as String
     // do it case-insensitive
     tableToExport = tableToExport.toUpperCase()
-    if (homogeneousOnly) {
-        tableToExport = "(SELECT THE_GEOM, IDRECEIVER, IDSOURCE, LEQ, METEO FROM " + tableToExport +
-                " WHERE METEO = 'homogeneous')"
+    if (homogeneousOnly || rayPeriod) {
+        String columns = homogeneousOnly ? 'THE_GEOM, IDRECEIVER, IDSOURCE, LEQ, METEO' : '*'
+        List<String> filters = []
+        if (homogeneousOnly) filters.add("METEO = 'homogeneous'")
+        if (rayPeriod) filters.add("PERIOD = '" + rayPeriod + "'")
+        tableToExport = '(SELECT ' + columns + ' FROM ' + tableToExport + ' WHERE ' + filters.join(' AND ') + ')'
     }
 
     List<String> fields = JDBCUtilities.getColumnNames(connection, tableToExport)
