@@ -18,6 +18,24 @@
 
 package org.noise_planet.noisemodelling.scripts.NoiseModelling
 
+import com.fasterxml.jackson.databind.ObjectWriter
+import org.noise_planet.noisemodelling.jdbc.IComputeRaysOutFactory
+import org.noise_planet.noisemodelling.jdbc.input.SceneWithEmission
+import org.noise_planet.noisemodelling.jdbc.output.AttenuationOutputMultiThread
+import org.noise_planet.noisemodelling.jdbc.output.NoiseMapWriter
+import org.noise_planet.noisemodelling.jdbc.output.ResultsCache
+import org.noise_planet.noisemodelling.pathfinder.CutPlaneVisitorFactory
+import org.noise_planet.noisemodelling.pathfinder.ThreadPool
+import org.noise_planet.noisemodelling.pathfinder.utils.profiler.JVMMemoryMetric
+import org.noise_planet.noisemodelling.pathfinder.utils.profiler.ProfilerThread
+import org.noise_planet.noisemodelling.pathfinder.utils.profiler.ProgressMetric
+import org.noise_planet.noisemodelling.pathfinder.utils.profiler.ReceiverStatsMetric
+import org.noise_planet.noisemodelling.propagation.AttenuationOutput
+import org.noise_planet.noisemodelling.propagation.PropagationModelCreator
+import org.noise_planet.noisemodelling.propagation.cnossos.CnossosPropagationModelCreator
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicBoolean
+
 import groovy.sql.Sql
 import org.h2gis.api.EmptyProgressVisitor
 import org.h2gis.api.ProgressVisitor
@@ -40,6 +58,110 @@ import java.sql.Statement
 import java.time.LocalDateTime
 import java.util.concurrent.TimeUnit
 
+/** Store only the frequency attenuation consumed by the ray decoder, before H2 insertion. */
+class CompactSpectralRayWriter extends NoiseMapWriter {
+    private final ObjectWriter spectralWriter = NoiseMapWriter.createJsonWriter()
+
+    CompactSpectralRayWriter(Connection connection, NoiseMapByReceiverMaker maker, ResultsCache cache,
+                             AtomicBoolean exitWhenDone, AtomicBoolean aborted) {
+        super(connection, maker, cache, exitWhenDone, aborted)
+    }
+
+    @Override
+    String attenuationOutputAsJSON(AttenuationOutput output) {
+        spectralWriter.writeValueAsString([aGlobal: output.aGlobal])
+    }
+}
+
+/**
+ * Groovy equivalent of DefaultCutPlaneProcessing with a compact JSON writer.
+ * Use the public factory API so no Java changes or private-field reflection are needed.
+ * Keep the default queues, propagation model, profiler and writer lifecycle.
+ */
+class CompactSpectralRayProcessing implements IComputeRaysOutFactory {
+    private final ResultsCache resultsCache = new ResultsCache()
+    private final NoiseMapDatabaseParameters parameters
+    private final AtomicBoolean exitWhenDone
+    private final AtomicBoolean aborted
+    private final ThreadPool postProcessingThreadPool = new ThreadPool()
+    private Connection connection
+    private NoiseMapByReceiverMaker maker
+    private ProfilerThread profilerThread
+    private Future<Boolean> writerFuture
+    private Future<?> profilerFuture
+    private PropagationModelCreator propagationModelCreator = new CnossosPropagationModelCreator()
+
+    CompactSpectralRayProcessing(NoiseMapDatabaseParameters parameters, AtomicBoolean exitWhenDone,
+                                 AtomicBoolean aborted) {
+        this.parameters = parameters
+        this.exitWhenDone = exitWhenDone
+        this.aborted = aborted
+    }
+
+    @Override
+    CutPlaneVisitorFactory create(SceneWithEmission scene) {
+        new AttenuationOutputMultiThread(scene, propagationModelCreator, resultsCache, parameters,
+                exitWhenDone, aborted)
+    }
+
+    @Override
+    void initialize(Connection connection, NoiseMapByReceiverMaker maker) {
+        this.connection = connection
+        this.maker = maker
+        if (parameters.CSVProfilerOutputPath != null) {
+            profilerThread = new ProfilerThread(parameters.CSVProfilerOutputPath)
+            profilerThread.addMetric(resultsCache)
+            profilerThread.addMetric(new JVMMemoryMetric())
+            profilerThread.addMetric(new ReceiverStatsMetric())
+            profilerThread.setWriteInterval(parameters.CSVProfilerWriteInterval)
+            profilerThread.setFlushInterval(parameters.CSVProfilerWriteInterval)
+            maker.setProfilerThread(profilerThread)
+        }
+    }
+
+    @Override
+    void start(ProgressVisitor progressLogger) throws SQLException {
+        def writer = new CompactSpectralRayWriter(connection, maker, resultsCache, exitWhenDone, aborted)
+        exitWhenDone.set(false)
+        if (profilerThread != null) {
+            profilerThread.addMetric(new ProgressMetric(progressLogger))
+            profilerFuture = postProcessingThreadPool.submit(profilerThread)
+        }
+        try {
+            writer.init()
+        } catch (Exception ex) {
+            throw new SQLException(ex)
+        }
+        writerFuture = postProcessingThreadPool.submitBlocking(writer)
+    }
+
+    @Override
+    void stop() throws SQLException {
+        exitWhenDone.set(true)
+        try {
+            if (writerFuture != null) writerFuture.get()
+            if (profilerThread != null) {
+                profilerThread.stop()
+                if (profilerFuture != null) profilerFuture.get()
+            }
+        } catch (Exception ex) {
+            throw new SQLException(ex)
+        } finally {
+            postProcessingThreadPool.shutdown()
+        }
+    }
+
+    @Override
+    void setPropagationModelCreator(PropagationModelCreator creator) {
+        propagationModelCreator = creator
+    }
+
+    @Override
+    PropagationModelCreator getPropagationModelCreator() {
+        propagationModelCreator
+    }
+}
+
 title = 'Computes the propagation from the sounds sources to the receivers'
 description = '&#10145;&#65039; Computes the propagation from the sounds sources to the receivers location using the noise emission table.' +
         '<hr>' +
@@ -53,6 +175,12 @@ description = '&#10145;&#65039; Computes the propagation from the sounds sources
         '<li><b> Hz63, Hz125, Hz250, Hz500, Hz1000,Hz2000, Hz4000, Hz8000 </b>: 8 columns giving the sound level for each octave band (FLOAT)</li></ul>'
 
 inputs = [
+        confExportSpectralRays: [
+                name: 'Export per-band ray attenuation',
+                title: 'Export per-band ray attenuation',
+                description: 'Retain the spectral attenuation needed for road and railway source contributions.',
+                type: Boolean.class
+        ],
         tableBuilding           : [
                 name       : 'Buildings table name',
                 title      : 'Buildings table name',
@@ -511,8 +639,12 @@ def exec(Connection connection, Map input, ProgressVisitor progress) {
             parameters.setRaysTable(input['confRaysName'] as String)
             parameters.setExportRaysMethod(NoiseMapDatabaseParameters.ExportRaysMethods.TO_RAYS_TABLE)
             parameters.exportAttenuationMatrix = true
-            parameters.exportAttenuationOutput = false
+            parameters.exportAttenuationOutput = input.getOrDefault('confExportSpectralRays', false) as Boolean
             parameters.keepAbsorption = false
+            if (parameters.exportAttenuationOutput) {
+                pointNoiseMap.setComputeRaysOutFactory(new CompactSpectralRayProcessing(
+                        parameters, pointNoiseMap.exitWhenDone, pointNoiseMap.aborted))
+            }
         }
     }
 
